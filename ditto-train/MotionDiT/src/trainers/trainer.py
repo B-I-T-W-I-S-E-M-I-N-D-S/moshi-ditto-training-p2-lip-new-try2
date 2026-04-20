@@ -154,6 +154,7 @@ class Trainer:
         self.loss_logger = open(loss_log, 'a')
 
         self.ckpt_file_list_for_clear = []
+        self.best_loss = float('inf')  # track best model
 
     def _init_lip_sync(self):
         """Initialize frozen SyncNet + renderer for lip-sync loss."""
@@ -358,7 +359,16 @@ class Trainer:
         ckpt_p = os.path.join(self.ckpt_path, f"train_{epoch}.pt")
         torch.save(ckpt, ckpt_p)
         tqdm.write(f"[MODEL SAVED at Epoch {epoch}] ({len(self.ckpt_file_list_for_clear)})")
-        
+
+        # ── Save best model as lmdm_v0.4_hubert.pth ──────────────────
+        if avg is not None:
+            total_loss = sum(v for k, v in avg.items() if k != 'sim_pred')
+            if total_loss < self.best_loss:
+                self.best_loss = total_loss
+                best_path = os.path.join(self.ckpt_path, "lmdm_v0.4_hubert.pth")
+                torch.save(state_dict, best_path)
+                tqdm.write(f"[BEST MODEL] Epoch {epoch}, loss={total_loss:.6f} → {best_path}")
+
         # clear model
         if epoch % self.opt.save_ckpt_freq != 0:
             self.ckpt_file_list_for_clear.append(ckpt_p)
