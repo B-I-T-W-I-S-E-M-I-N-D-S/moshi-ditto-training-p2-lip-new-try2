@@ -199,7 +199,16 @@ class Trainer:
 
         opt = self.opt
         B = x_recon.shape[0]
-        B_sync = min(opt.lip_sync_batch_size, B)
+
+        # Check which samples have valid lip-sync features
+        if 'lipsync_valid' not in data_dict:
+            return None, {}
+        valid_mask = data_dict['lipsync_valid']  # (B,) bool tensor
+        valid_indices = [i for i in range(B) if valid_mask[i]]
+        if len(valid_indices) == 0:
+            return None, {}
+
+        B_sync = min(opt.lip_sync_batch_size, len(valid_indices))
 
         # Get lip-sync data from data_dict
         t_starts = data_dict['lipsync_t_start']        # (B,) int
@@ -209,11 +218,11 @@ class Trainer:
         A_batch = data_dict['lipsync_A']                 # (B, 512)
         sim_gt_batch = data_dict['lipsync_sim_gt']       # (B,)
 
-        # Select random subset of batch
-        if B_sync < B:
-            indices = _random.sample(range(B), B_sync)
+        # Select random subset from valid samples only
+        if B_sync < len(valid_indices):
+            indices = _random.sample(valid_indices, B_sync)
         else:
-            indices = list(range(B))
+            indices = valid_indices
 
         # Extract 5-frame predicted motion windows per sample
         pred_windows = []
@@ -286,8 +295,9 @@ class Trainer:
                 lip_loss, lip_loss_dict = self._compute_lip_sync_loss(
                     x_recon, data_dict
                 )
-                loss = loss + lip_loss
-                loss_dict.update(lip_loss_dict)
+                if lip_loss is not None:
+                    loss = loss + lip_loss
+                    loss_dict.update(lip_loss_dict)
             except Exception:
                 # Don't crash training if lip-sync fails on a batch
                 if self.is_main_process and self.global_step % 100 == 0:
@@ -326,8 +336,12 @@ class Trainer:
 
         # show all loss
         avg_loss_msg = "|"
-        for k, v in DAM.average().items():
-            avg_loss_msg += " %s: %.6f |" % (k, v)
+        avg = DAM.average()
+        if avg is not None:
+            for k, v in avg.items():
+                avg_loss_msg += " %s: %.6f |" % (k, v)
+        else:
+            avg_loss_msg += " NO DATA |"
         msg = f'Epoch: {epoch}, Global_Steps: {self.global_step}, {avg_loss_msg}'
         print(msg, file=self.loss_logger)
         self.loss_logger.flush()

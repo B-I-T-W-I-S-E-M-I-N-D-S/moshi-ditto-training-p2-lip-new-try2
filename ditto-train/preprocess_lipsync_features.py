@@ -26,6 +26,7 @@ Multi-GPU:
 import os
 import sys
 import json
+import types
 import argparse
 import traceback
 
@@ -39,12 +40,30 @@ CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CUR_DIR)
 MOTIONDIT_DIR = os.path.join(CUR_DIR, "MotionDiT")
 INFERENCE_DIR = os.path.join(PROJECT_ROOT, "ditto-inference")
-INFERENCE_MODULES = os.path.join(INFERENCE_DIR, "core", "models", "modules")
+MODULES_DIR = os.path.join(INFERENCE_DIR, "core", "models", "modules")
 
-if MOTIONDIT_DIR not in sys.path:
-    sys.path.insert(0, MOTIONDIT_DIR)
-if INFERENCE_MODULES not in sys.path:
-    sys.path.insert(0, INFERENCE_MODULES)
+
+def _setup_liveportrait_imports():
+    """
+    Set up imports for LivePortrait modules (AppearanceFeatureExtractor, etc.).
+
+    These modules use relative imports (from .util import ...), so we must
+    create a synthetic package with the correct __path__ so Python can
+    resolve them.
+    """
+    if 'lp_modules' in sys.modules:
+        return  # already set up
+
+    # Create a synthetic package called 'lp_modules'
+    pkg = types.ModuleType('lp_modules')
+    pkg.__path__ = [MODULES_DIR]
+    pkg.__package__ = 'lp_modules'
+    pkg.__file__ = os.path.join(MODULES_DIR, '__init__.py')
+    sys.modules['lp_modules'] = pkg
+
+    # Also register it under the name the relative imports expect
+    # When we do `from lp_modules.appearance_feature_extractor import ...`
+    # the file has `from .util import ...` which resolves to `lp_modules.util`
 
 
 # ── Mel spectrogram (matching Wav2Lip) ────────────────────────────────────
@@ -127,24 +146,26 @@ def mel_to_syncnet_windows(mel, fps=25, sr=16000, hop_length=200, num_frames=5):
 
 # ── Lip region extraction ─────────────────────────────────────────────────
 
-def extract_lip_crop(frame_256, lip_size=96):
+def extract_lip_crop(frame_256, lip_h=48, lip_w=96):
     """
     Extract lip region from a 256×256 face crop.
+    SyncNet expects the LOWER HALF of a 96×96 face = 48×96.
 
     Args:
         frame_256: (H, W, 3) uint8 RGB, 256×256
 
     Returns:
-        lip_crop: (lip_size, lip_size, 3) uint8
+        lip_crop: (lip_h, lip_w, 3) uint8  [default 48×96]
     """
     H, W = frame_256.shape[:2]
+    # Crop lower-center mouth region
     y_start = int(H * 0.55)
     y_end = int(H * 0.95)
     x_start = int(W * 0.1)
     x_end = int(W * 0.9)
 
     lip = frame_256[y_start:y_end, x_start:x_end]
-    lip = cv2.resize(lip, (lip_size, lip_size), interpolation=cv2.INTER_AREA)
+    lip = cv2.resize(lip, (lip_w, lip_h), interpolation=cv2.INTER_AREA)
     return lip
 
 
@@ -319,20 +340,20 @@ def process_one_video(
             for f_offset in range(num_frames):
                 f_idx = w_idx + f_offset
                 if f_idx < N_frames:
-                    lip = extract_lip_crop(all_frames_256[f_idx], lip_size)
+                    lip = extract_lip_crop(all_frames_256[f_idx])
                 else:
-                    lip = extract_lip_crop(all_frames_256[-1], lip_size)
+                    lip = extract_lip_crop(all_frames_256[-1])
                 # Normalize to [0, 1]
                 lip_norm = lip.astype(np.float32) / 255.0
-                lip_frames.append(lip_norm.transpose(2, 0, 1))  # (3, 96, 96)
+                lip_frames.append(lip_norm.transpose(2, 0, 1))  # (3, 48, 96)
 
-            # Stack 5 frames → (15, 96, 96)
-            lips_stacked = np.concatenate(lip_frames, axis=0)  # (15, 96, 96)
+            # Stack 5 frames → (15, 48, 96)
+            lips_stacked = np.concatenate(lip_frames, axis=0)  # (15, 48, 96)
             batch_lips.append(lips_stacked)
 
         # Convert to tensors
         mel_tensor = torch.from_numpy(np.array(batch_mel)).float().to(device)  # (bs, 1, 80, 16)
-        lips_tensor = torch.from_numpy(np.array(batch_lips)).float().to(device)  # (bs, 15, 96, 96)
+        lips_tensor = torch.from_numpy(np.array(batch_lips)).float().to(device)  # (bs, 15, 48, 96)
 
         with torch.no_grad():
             audio_emb, face_emb = syncnet(mel_tensor, lips_tensor)
@@ -381,24 +402,28 @@ def main():
     print("Loading models...")
 
     # SyncNet
-    sys.path.insert(0, os.path.join(CUR_DIR, "MotionDiT"))
+    if MOTIONDIT_DIR not in sys.path:
+        sys.path.insert(0, MOTIONDIT_DIR)
     from src.models.syncnet import load_syncnet
     syncnet = load_syncnet(args.syncnet_ckpt, device)
 
+    # Set up LivePortrait imports (handles relative imports like `from .util import ...`)
+    _setup_liveportrait_imports()
+
     # LivePortrait AppearanceFeatureExtractor
-    from appearance_feature_extractor import AppearanceFeatureExtractor
+    from lp_modules.appearance_feature_extractor import AppearanceFeatureExtractor
     app_ext = AppearanceFeatureExtractor()
     app_ext_ckpt = os.path.join(args.ditto_pytorch_path, "models", "appearance_extractor.pth")
-    app_ext.load_state_dict(torch.load(app_ext_ckpt, map_location="cpu"))
+    app_ext.load_state_dict(torch.load(app_ext_ckpt, map_location="cpu", weights_only=True))
     app_ext = app_ext.to(device).eval()
     app_ext.requires_grad_(False)
     print(f"  AppearanceExtractor: {app_ext_ckpt}")
 
     # LivePortrait MotionExtractor
-    from motion_extractor import MotionExtractor
+    from lp_modules.motion_extractor import MotionExtractor
     mot_ext = MotionExtractor()
     mot_ext_ckpt = os.path.join(args.ditto_pytorch_path, "models", "motion_extractor.pth")
-    mot_ext.load_state_dict(torch.load(mot_ext_ckpt, map_location="cpu"))
+    mot_ext.load_state_dict(torch.load(mot_ext_ckpt, map_location="cpu", weights_only=True))
     mot_ext = mot_ext.to(device).eval()
     mot_ext.requires_grad_(False)
     print(f"  MotionExtractor:     {mot_ext_ckpt}")

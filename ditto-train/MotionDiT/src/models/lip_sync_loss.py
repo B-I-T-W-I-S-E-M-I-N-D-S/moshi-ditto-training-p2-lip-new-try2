@@ -159,19 +159,18 @@ def motion_vec_to_keypoints(motion_265, kp_canonical):
 # 2. Lip region extraction
 # ===========================================================================
 
-def extract_lip_region(frames, lip_size=96):
+def extract_lip_region(frames, lip_h=48, lip_w=96):
     """
     Extract lip/mouth region from rendered face frames using a fixed crop.
 
-    The input frames are 256×256 face-aligned crops (from LivePortrait).
-    The mouth is approximately in the lower 40% height, middle 80% width.
+    SyncNet expects the LOWER HALF of a 96×96 face = (B, 3, 48, 96).
+    Input frames are 256×256 face-aligned crops from LivePortrait.
 
     Args:
         frames: (B, 3, H, W)  rendered face images, values in [0, 1]
-                H=W=256 for LivePortrait output (or 512 with upscale=2)
 
     Returns:
-        lips: (B, 3, lip_size, lip_size)  cropped and resized lip regions
+        lips: (B, 3, lip_h, lip_w)  cropped and resized lip regions
     """
     _, _, H, W = frames.shape
 
@@ -183,9 +182,9 @@ def extract_lip_region(frames, lip_size=96):
 
     lips = frames[:, :, y_start:y_end, x_start:x_end]
 
-    # Resize to SyncNet input size
-    if lips.shape[2] != lip_size or lips.shape[3] != lip_size:
-        lips = F.interpolate(lips, size=(lip_size, lip_size),
+    # Resize to SyncNet input size (48×96)
+    if lips.shape[2] != lip_h or lips.shape[3] != lip_w:
+        lips = F.interpolate(lips, size=(lip_h, lip_w),
                              mode='bilinear', align_corners=False)
 
     return lips
@@ -208,41 +207,47 @@ class FrozenRenderer(nn.Module):
     def __init__(self, warp_ckpt: str, decoder_ckpt: str, device: str = "cuda"):
         super().__init__()
 
-        # Import LivePortrait modules
-        import importlib
         import sys
         import os
+        import types
 
-        # Add ditto-inference to path for importing modules
+        # Find the LivePortrait modules directory
+        # lip_sync_loss.py is at: ditto-train/MotionDiT/src/models/lip_sync_loss.py
+        # We need:               ditto-inference/core/models/modules/
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            os.path.dirname(cur_dir)
         )))
-        inference_modules_path = os.path.join(project_root, "ditto-inference", "core", "models", "modules")
+        modules_dir = os.path.join(
+            project_root, "ditto-inference", "core", "models", "modules"
+        )
 
-        # Direct import of the module classes
-        sys.path.insert(0, inference_modules_path)
+        # Create synthetic package for LivePortrait modules
+        # This allows relative imports like `from .util import ...` to work
+        if 'lp_modules' not in sys.modules:
+            pkg = types.ModuleType('lp_modules')
+            pkg.__path__ = [modules_dir]
+            pkg.__package__ = 'lp_modules'
+            pkg.__file__ = os.path.join(modules_dir, '__init__.py')
+            sys.modules['lp_modules'] = pkg
 
-        # We need to handle the relative imports in the LivePortrait modules
         # Load WarpingNetwork
-        from warping_network import WarpingNetwork
+        from lp_modules.warping_network import WarpingNetwork
         self.warp_net = WarpingNetwork()
-        warp_sd = torch.load(warp_ckpt, map_location="cpu")
+        warp_sd = torch.load(warp_ckpt, map_location="cpu", weights_only=True)
         self.warp_net.load_state_dict(warp_sd)
         self.warp_net = self.warp_net.to(device)
         self.warp_net.eval()
         self.warp_net.requires_grad_(False)
 
         # Load SPADEDecoder
-        from spade_generator import SPADEDecoder
+        from lp_modules.spade_generator import SPADEDecoder
         self.decoder = SPADEDecoder()
-        dec_sd = torch.load(decoder_ckpt, map_location="cpu")
+        dec_sd = torch.load(decoder_ckpt, map_location="cpu", weights_only=True)
         self.decoder.load_state_dict(dec_sd)
         self.decoder = self.decoder.to(device)
         self.decoder.eval()
         self.decoder.requires_grad_(False)
-
-        # Clean up sys.path
-        sys.path.remove(inference_modules_path)
 
         self.device = device
         print(f"[FrozenRenderer] Loaded WarpingNetwork: {warp_ckpt}")
@@ -293,13 +298,15 @@ class LipSyncLoss(nn.Module):
         warp_ckpt: str,
         decoder_ckpt: str,
         device: str = "cuda",
-        lip_size: int = 96,
+        lip_h: int = 48,
+        lip_w: int = 96,
         num_frames: int = 5,
     ):
         super().__init__()
 
         self.device = device
-        self.lip_size = lip_size
+        self.lip_h = lip_h
+        self.lip_w = lip_w
         self.num_frames = num_frames
 
         # Load frozen SyncNet
@@ -377,12 +384,12 @@ class LipSyncLoss(nn.Module):
         # 2. Extract lip regions from each frame
         _, T, C, H, W = rendered.shape
         rendered_flat = rendered.reshape(B * T, C, H, W)
-        lips = extract_lip_region(rendered_flat, self.lip_size)  # (B*T, 3, 96, 96)
-        lips = lips.reshape(B, T, 3, self.lip_size, self.lip_size)
+        lips = extract_lip_region(rendered_flat, self.lip_h, self.lip_w)  # (B*T, 3, 48, 96)
+        lips = lips.reshape(B, T, 3, self.lip_h, self.lip_w)
 
         # 3. Stack 5 frames along channel dim for SyncNet input
-        # SyncNet expects (B, 15, 96, 96) = 5 frames × 3 channels
-        lips_stacked = lips.reshape(B, T * 3, self.lip_size, self.lip_size)  # (B, 15, 96, 96)
+        # SyncNet expects (B, 15, 48, 96) = 5 frames × 3 channels
+        lips_stacked = lips.reshape(B, T * 3, self.lip_h, self.lip_w)  # (B, 15, 48, 96)
 
         # 4. Get visual embedding through frozen SyncNet face encoder
         #    (audio encoder is not needed — A is precomputed)

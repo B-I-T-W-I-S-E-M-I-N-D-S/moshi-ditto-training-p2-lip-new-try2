@@ -167,11 +167,22 @@ class Stage2Dataset(Dataset):
 
         # Lip-sync features (per-video, loaded once)
         if self.use_lip_sync_loss:
-            arr_data['lipsync_f_s'] = np.load(data['lipsync_f_s'])        # (1, 32, 16, 64, 64)
-            arr_data['lipsync_x_s'] = np.load(data['lipsync_x_s'])        # (1, 21, 3)
-            arr_data['lipsync_kp_canonical'] = np.load(data['lipsync_kp_canonical'])  # (1, 63)
-            arr_data['lipsync_A'] = np.load(data['lipsync_A'])            # (N_windows, 512)
-            arr_data['lipsync_sim_gt'] = np.load(data['lipsync_sim_gt'])  # (N_windows,)
+            try:
+                lipsync_paths_ok = all(
+                    data.get(k, '') != '' 
+                    for k in ['lipsync_f_s', 'lipsync_x_s', 'lipsync_kp_canonical', 'lipsync_A', 'lipsync_sim_gt']
+                )
+                if lipsync_paths_ok:
+                    arr_data['lipsync_f_s'] = np.load(data['lipsync_f_s'])        # (1, 32, 16, 64, 64)
+                    arr_data['lipsync_x_s'] = np.load(data['lipsync_x_s'])        # (1, 21, 3)
+                    arr_data['lipsync_kp_canonical'] = np.load(data['lipsync_kp_canonical'])  # (1, 63)
+                    arr_data['lipsync_A'] = np.load(data['lipsync_A'])            # (N_windows, 512)
+                    arr_data['lipsync_sim_gt'] = np.load(data['lipsync_sim_gt'])  # (N_windows,)
+                    arr_data['lipsync_valid'] = True
+                else:
+                    arr_data['lipsync_valid'] = False
+            except Exception:
+                arr_data['lipsync_valid'] = False
 
         return arr_data
     
@@ -301,7 +312,7 @@ class Stage2Dataset(Dataset):
             data_dict['kp_cond_end'] = kp_cond_end
 
         # Lip-sync data: return precomputed features for a random 5-frame window
-        if self.use_lip_sync_loss:
+        if self.use_lip_sync_loss and arr_data.get('lipsync_valid', False):
             max_start = max(0, seq_len - 5)
             t_start = random.randint(0, max_start)
             window_idx = f_idx + t_start  # index into precomputed arrays
@@ -318,6 +329,9 @@ class Stage2Dataset(Dataset):
             data_dict['lipsync_A'] = A_arr[window_idx]       # (512,)
             data_dict['lipsync_sim_gt'] = sim_gt_arr[window_idx]  # scalar
             data_dict['lipsync_t_start'] = t_start
+            data_dict['lipsync_valid'] = True
+        elif self.use_lip_sync_loss:
+            data_dict['lipsync_valid'] = False
         
         return data_dict
     
